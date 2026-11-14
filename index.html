@@ -1208,10 +1208,21 @@ details summary { cursor: pointer; font-weight: 600; }
     const b2bLabel = SOFT_RULES.b2b[1];
     const relaxed = result.warnings.filter(w => !["ΔΕΝ ΦΤΑΝΟΥΝ ΤΑ ΑΤΟΜΑ", "ΚΑΝΕΝΑΣ ΜΕ ΑΥΤΟ ΤΟ ΒΑΘΜΟ", b2bLabel].includes(w.rule)).length;
     const b2b = result.warnings.filter(w => w.rule === b2bLabel).length;  // information only
+    // who: «12 άτομα ... - ΣΤΡ: 10 άτομα, συνήθως 2 φορές ο καθένας»
+    const per = new Map();
+    result.warnings.filter(w => w.rule === b2bLabel).forEach(w => per.set(w.worker, (per.get(w.worker) || 0) + 1));
+    const rankOf = new Map(sch.workers.map(w => [w.name, rankKey(w.rank)])), byRank = new Map();
+    for (const [n, c] of per) { const g = rankOf.get(n) || ""; if (!byRank.has(g)) byRank.set(g, []); byRank.get(g).push(c); }
+    const b2bText = !per.size ? "" : `${per.size} άτομα μπήκαν 2 συνεχόμενες μέρες (σύνολο ${b2b} φορές σε ${result.days} ${result.days === 1 ? "μέρα" : "μέρες"}) - ` +
+      [...byRank].sort((a, b) => rankSort(a[0]) - rankSort(b[0])).map(([g, ns]) => {
+        const cnt = new Map(); ns.forEach(x => cnt.set(x, (cnt.get(x) || 0) + 1));
+        const common = [...cnt].sort((a, b) => b[1] - a[1] || a[0] - b[0])[0][0];
+        return `${g}: ${ns.length} άτομα, συνήθως ${common} ${common === 1 ? "φορά" : "φορές"} ο καθένας`;
+      }).join("; ");
     const unarmed = [...new Set(seats.flat(2).filter(x => x && x.unarmed).map(x => x.name))];
     return { startIso: result.startIso, endIso: result.endIso, days: result.days, dates: sch.dates, posts, seats,
       warnings: result.warnings, shortage: result.shortage || [], formNotes: result.formNotes, notices: result.notices, errors: result.errors, cycles: result.cycles, seed: result.seed,
-      stats: { seats: sch.regular.reduce((a, p) => a + p.needed, 0) * result.days, unfilled: res.unfilled, relaxed, unarmed, b2b },
+      stats: { seats: sch.regular.reduce((a, p) => a + p.needed, 0) * result.days, unfilled: res.unfilled, relaxed, unarmed, b2b, b2bText },
       made: new Date().toISOString() };
   }
 
@@ -2405,7 +2416,7 @@ window.LICENSES = "ΑΔΕΙΕΣ ΛΟΓΙΣΜΙΚΟΥ ΤΡΙΤΩΝ / THIRD-PARTY 
         <div class="stat"><b>${st.unarmed.length}</b><span>άοπλοι</span></div>
       </div>
       ${emptySeatsNotice(v)}
-      ${st.b2b ? `<div class="notice info" role="note">ℹ Ενημέρωση: ${st.b2b} φορές μπήκε κάποιος 2 συνεχόμενες μέρες, γιατί μέρα παρά μέρα δεν έφταναν τα άτομα. Μπήκαν με τη σειρά (πρώτα όσοι δεν είχαν ξαναμπεί).</div>` : ""}
+      ${st.b2b ? `<div class="notice info" role="note">ℹ Ενημέρωση: ${esc(st.b2bText || st.b2b + " φορές 2 συνεχόμενες μέρες")}. Μέρα παρά μέρα δεν έφταναν τα άτομα, γι' αυτό μπήκαν με τη σειρά (πρώτα όσοι δεν είχαν ξαναμπεί).</div>` : ""}
       ${(v.shortage || []).filter(x => typeof x === "object").length ? `<div class="notice" role="note"><b>⚠ Δεν φτάνουν τα άτομα για μία μέρα</b>
         <div style="margin:4px 0 6px">Σε μία μέρα οι θέσεις είναι περισσότερες από τα άτομα, οπότε κάποιες θέσεις μένουν κενές (κανείς δεν παίρνει 2 υπηρεσίες την ίδια μέρα).</div>
         ${v.shortage.filter(x => typeof x === "object").map(x => `<div><b>${esc(x.rank)}</b>: ${Math.round(x.seats / Math.max(1, v.days))} θέσεις τη μέρα για ${x.people} άτομα</div>`).join("")}</div>` : ""}
