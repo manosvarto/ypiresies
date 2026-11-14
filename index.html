@@ -275,6 +275,8 @@ details summary { cursor: pointer; font-weight: 600; }
   const CONFIG = {
     dayStart: 360, maxSoft: 1, maxHard: 1, noBackToBack: true, minGap: 60, variety: "service", restPreferred: 12 * 60,
     attempts: 20, defaultRank: "ΣΤΡ",
+    detachedPerWeek: 3,        // μία εβδομάδα απόσπασης μετράει σαν 3 υπηρεσίες (λιγότερες μέρες: αναλογικά)
+    catchupRanks: ["ΣΤΡ"],     // μετά από άδεια: όποιος έμεινε πίσω μπαίνει πρώτος μέχρι να φτάσει τους άλλους
   };
   const SOFT_RULES = {
     same_service: [1, "ίδια υπηρεσία ξανά μέσα στην εβδομάδα"],
@@ -413,6 +415,35 @@ details summary { cursor: pointer; font-weight: 600; }
     for (const tok of raw.split(/[^Α-ΩA-Z]+/)) if (SHIFT_ALIASES[tok]) out.push(SHIFT_ALIASES[tok]);
     return out;
   }
+  /* «20/11/2026-24/11/2026; 05/12-07/12» (or one date) -> [[fromIso, toIso]] */
+  function parseRanges(v, startIso) {
+    const one = t => {
+      if (t instanceof Date) return excelDateToIso(t);
+      t = norm(t);
+      let iso = excelDateToIso(t);
+      const m = t.match(/^(\d{1,2})[\/.](\d{1,2})$/);
+      if (!iso && m && startIso) {
+        const y = +startIso.slice(0, 4);
+        iso = [y - 1, y, y + 1].map(yy => `${yy}-${pad2(m[2])}-${pad2(m[1])}`)
+          .sort((a, b) => Math.abs(diffDays(a, startIso)) - Math.abs(diffDays(b, startIso)))[0];
+      }
+      return iso;
+    };
+    if (v instanceof Date) { const d = one(v); return d ? [[d, d]] : []; }
+    const out = [];
+    for (let tok of String(v || "").split(/[;,\n]+/)) {
+      tok = tok.trim();
+      if (!tok) continue;
+      let parts = tok.split(/\s*(?:–|—|έως|εως|ως|\s-\s)\s*/i).map(x => x.trim()).filter(Boolean);
+      if (parts.length === 1 && (tok.match(/-/g) || []).length === 1) parts = tok.split("-").map(x => x.trim());
+      const ds = parts.slice(0, 2).map(one);
+      if (!ds.length || ds.some(d => !d)) continue;
+      let [a, b] = [ds[0], ds[ds.length - 1]];
+      if (b < a) [a, b] = [b, a];
+      out.push([a, b]);
+    }
+    return out;
+  }
   function parseUnavailable(v, startIso) {
     const weekdays = new Set(), dates = new Set();
     for (const tok of splitList(v)) {
@@ -516,11 +547,16 @@ details summary { cursor: pointer; font-weight: 600; }
         forbiddenTasksRaw: splitList(r.tasks), forbiddenPosts: new Set(), note: r.note || "", exemptParts: [] };
       const un = parseUnavailable(r.days, startIso);
       w.unavailableWeekdays = un.weekdays; w.unavailableDates = un.dates;
+      // άδεια: no duty, afterwards he catches up (ΣΤΡ) · απόσπαση: no duty, counts as duties done
+      w.leave = parseRanges(r.leave, startIso); w.detached = parseRanges(r.detached, startIso);
+      for (const [a, b] of w.leave.concat(w.detached)) for (let d = a; d <= b; d = addDays(d, 1)) w.unavailableDates.add(d);
       if (w.unarmed) w.exemptParts.push("ΑΟΠΛΟΣ");
       if (w.no24h) w.exemptParts.push("όχι 24ωρες");
       if (r.shifts) w.exemptParts.push(`όχι ώρες: ${r.shifts}`);
       if (r.tasks) w.exemptParts.push(`όχι: ${r.tasks}`);
-      if (r.days) w.exemptParts.push(`άδεια: ${r.days}`);
+      if (r.days) w.exemptParts.push(`λείπει: ${r.days}`);
+      if (r.leave) w.exemptParts.push(`άδεια: ${r.leave}`);
+      if (r.detached) w.exemptParts.push(`απόσπαση: ${r.detached}`);
       for (const tok of w.forbiddenTasksRaw) {
         const t = norm(tok);
         let hits = posts.filter(p => [norm(p.service), norm(p.task), norm(p.post)].includes(t));
@@ -621,6 +657,18 @@ details summary { cursor: pointer; font-weight: 600; }
         const [mon, t] = key.split("|");
         if (byTask.has(t)) this.priorWeekly.set(mon + "|" + byTask.get(t), ws.slice());
       }
+      // απόσπαση counts as duties done (CONFIG.detachedPerWeek per week, pro rata) up to each day of the roster;
+      // άδεια: the ranks in CONFIG.catchupRanks catch up afterwards (see run)
+      const perDayCredit = (+CONFIG.detachedPerWeek || 0) / 7;
+      const credit = (w, date) => perDayCredit * w.detached.reduce((a, [f, t]) => a + (date >= f ? diffDays(date < t ? date : t, f) + 1 : 0), 0);
+      this.creditDay = workers.map(w => this.dates.map(d => credit(w, d)));
+      this.leaveStarted = workers.map(w => this.dates.map(d => w.leave.some(([f]) => f <= d)));
+      this.catchupGroups = new Set((CONFIG.catchupRanks || []).map(rankKey));
+      this.avgHours = new Map();
+      for (const g of this.members.keys()) {
+        const hs = this.regular.filter(p => !p.weekly && this.postGroups.get(p.idx).has(g)).map(p => p.hours);
+        this.avgHours.set(g, hs.length ? hs.reduce((a, b) => a + b, 0) / hs.length : 0);
+      }
       this.fairGroups = [...this.members.values()].map(ms => [...ms].filter(w => this.dayOk[w].every(Boolean)
         && !workers[w].forbiddenPosts.size && !workers[w].forbiddenWindows.length && !this.fixedWorkers.has(w)));
     }
@@ -673,6 +721,9 @@ details summary { cursor: pointer; font-weight: 600; }
       let served = new Set(this.startServed), early = new Set(this.startEarly);
       const canServe = this.workers.map(w => this.regular.some(p => this.postOk[w.idx][p.idx]) && !this.fixedWorkers.has(w.idx));
       const holders = new Map([...this.priorWeekly].map(([k, v]) => [k, v.slice()]));
+      // duties done so far (history + this roster): after a leave, whoever is behind catches up
+      const totalCount = this.priorTotal.map(t => [...t].reduce((a, [k, v]) => a + (String(k).startsWith("#") ? 0 : v), 0));
+      const behind = new Array(nW).fill(0);
       const K = (d, p, s) => d + ":" + p + (s === undefined ? "" : ":" + s);
       const inc = (m, k) => m.set(k, (m.get(k) || 0) + 1);
 
@@ -696,7 +747,8 @@ details summary { cursor: pointer; font-weight: 600; }
           if (gap < CONFIG.minGap && (worst === null || gap < worst)) { worst = gap; worstLabel = label; }
         }
         const viol = [];
-        if (b2b) viol.push(["b2b", `${b2bCount[w] + 1}η φορά`, b2bCount[w] + 1]);
+        // whoever is behind after a leave does not climb in weight, so he can catch up
+        if (b2b) viol.push(["b2b", `${b2bCount[w] + 1}η φορά`, behind[w] > 0 ? 1 : b2bCount[w] + 1]);
         if (worst !== null) viol.push(["gap", `${worst} λεπτά από ${worstLabel}`]);
         if (perDay[w][d] >= CONFIG.maxSoft) viol.push(["day_limit", `${perDay[w][d] + 1}η υπηρεσία της ημέρας`]);
         if (postWeek[w].get(p.task)) {
@@ -739,8 +791,9 @@ details summary { cursor: pointer; font-weight: 600; }
           // ΣΤΡ: Saturday/Sunday duties go round too - whoever had the fewest weekends first
           const weekend = weekday(this.dates[d]) >= 5 && this.group[w] === strRank ? (svcTotal[w].get(WEEKEND_KEY) || 0) : 0;
           // equal hours: the one with the fewest hours so far (history + this roster) first, in 8-hour steps
-          const hoursLoad = Math.floor((svcTotal[w].get(HOURS_KEY) || 0) / 8);
-          const key = [major, repeat, minor, weekend, load, arm, hoursLoad, svcTotal[w].get(p.service) || 0, tired, R()];
+          const hoursLoad = Math.floor(((svcTotal[w].get(HOURS_KEY) || 0) + this.creditDay[w][d] * this.avgHours.get(this.group[w])) / 8);
+          // after a leave: whoever is behind the others goes first until he catches up (still every other day)
+          const key = [major, -behind[w], repeat, minor, weekend, load, arm, hoursLoad, svcTotal[w].get(p.service) || 0, tired, R()];
           if (!bestKey || less(key, bestKey)) { best = w; bestKey = key; bestViol = viol; }
         }
         if (best === null) { res.unfilled++; res.severity += UNFILLED_PENALTY; return null; }
@@ -748,7 +801,7 @@ details summary { cursor: pointer; font-weight: 600; }
         if (served.has(best)) { early.add(best); cycleOf.set(K(d, p.idx, slot), cyc(g) + 1); res.earlyRepeats++; }
         else { served.add(best); cycleOf.set(K(d, p.idx, slot), cyc(g)); }
         occupy(best, p, d);
-        count[best]++; hours[best] += p.hours; perDay[best][d]++;
+        count[best]++; totalCount[best]++; hours[best] += p.hours; perDay[best][d]++;
         if (!p.weekly) { onDuty[best].add(d); }
         inc(svcWeek[best], p.service); inc(svcTotal[best], p.service); inc(postWeek[best], p.task);
         add(svcTotal[best], HOURS_KEY, p.hours);
@@ -809,6 +862,14 @@ details summary { cursor: pointer; font-weight: 600; }
         if (d > 0 && weekday(this.dates[d]) === 0) { svcWeek = this.workers.map(() => new Map()); postWeek = this.workers.map(() => new Map()); }
         const mon = mondayOf(this.dates[d]);
         const hoursBefore = svcTotal.map(t => t.get(HOURS_KEY) || 0);
+        // behind after a leave: duties (with the απόσπαση credit) below the average of the rank
+        for (const [g, ms] of this.members) {
+          const pool = [...ms].filter(w => canServe[w]);
+          if (!this.catchupGroups.has(g) || !pool.length) continue;
+          const eff = new Map(pool.map(w => [w, totalCount[w] + this.creditDay[w][d]]));
+          const avg = [...eff.values()].reduce((a, b) => a + b, 0) / pool.length;
+          for (const w of pool) behind[w] = this.leaveStarted[w][d] ? Math.max(0, Math.floor(avg - eff.get(w) + 1e-9)) : 0;
+        }
         // «σταθερό άτομο»: the same person every day; someone else only when that person is away
         for (const p of this.regular.filter(p => this.fixedOf.has(p.idx))) {
           const seats = []; assign.set(K(d, p.idx), seats);
@@ -816,7 +877,7 @@ details summary { cursor: pointer; font-weight: 600; }
           for (let slot = 0; slot < p.needed; slot++) {
             const w = slot < ids.length ? ids[slot] : null;
             if (w !== null && this.dayOk[w][d]) {
-              seats.push(w); occupy(w, p, d); count[w]++; hours[w] += p.hours; perDay[w][d]++;
+              seats.push(w); occupy(w, p, d); count[w]++; totalCount[w]++; hours[w] += p.hours; perDay[w][d]++;
               onDuty[w].add(d);
               cycleOf.set(K(d, p.idx, slot), cyc(this.group[w]));
             } else seats.push(this.noOne.has(p.idx) ? null : pick(p, d, slot));
@@ -849,7 +910,7 @@ details summary { cursor: pointer; font-weight: 600; }
             for (let slot = 0; slot < p.needed; slot++) {
               const w = slot < before.length ? before[slot] : null;
               if (w !== null && w !== undefined && this.dayOk[w][d] && this.postOk[w][p.idx] && perDay[w][d] < CONFIG.maxHard && !seats.includes(w)) {
-                seats.push(w); occupy(w, p, d); count[w]++; hours[w] += p.hours; perDay[w][d]++;
+                seats.push(w); occupy(w, p, d); count[w]++; totalCount[w]++; hours[w] += p.hours; perDay[w][d]++;
                 onDuty[w].add(d);
                 add(svcTotal[w], HOURS_KEY, p.hours); inc(svcTotal[w], WEEKEND_KEY);
                 cycleOf.set(K(d, p.idx, slot), cycleOf.has(K(d - 1, p.idx, slot)) ? cycleOf.get(K(d - 1, p.idx, slot)) : cyc(this.group[w]));
@@ -1158,7 +1219,7 @@ details summary { cursor: pointer; font-weight: 600; }
   }
 
   const api = { norm, splitList, splitNames, parseBool, parseTimes, parseForbiddenShifts, parseUnavailable, buildPosts, buildWorkers,
-    postAllowed, rankKey, rankSet, rankSort, taskName, isOutpost, Scheduler, generate, suggestStart, makeView, emptyHistory, historyCycle,
+    postAllowed, rankKey, rankSet, rankSort, taskName, isOutpost, parseRanges, Scheduler, generate, suggestStart, makeView, emptyHistory, historyCycle,
     lastDate, prepareHistory, addDays, diffDays, weekday, mondayOf, fmtDate, dateToIso, excelDateToIso,
     DAY_NAMES, DAY_SHORT, SUGGESTED, DEFAULT_NOTES, PRESET_TIMES, SHIFT_WINDOWS, CONFIG, SOFT_RULES, RANK_ORDER, THAL_1, THAL_2, THAL_3 };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
@@ -1207,7 +1268,8 @@ details summary { cursor: pointer; font-weight: 600; }
     unarmed: ["UNARMED", "ΑΟΠΛΟΣ", "ΑΟΠΛΟΙ"], no24h: ["NO_24H", "ΟΧΙ 24ΩΡΕΣ", "ΟΧΙ_24ΩΡΕΣ"],
     shifts: ["FORBIDDEN_SHIFTS", "ΟΧΙ ΩΡΕΣ", "ΟΧΙ_ΩΡΕΣ", "ΑΠΑΓΟΡΕΥΜΕΝΕΣ ΩΡΕΣ"],
     tasks: ["FORBIDDEN_TASKS", "ΟΧΙ ΥΠΗΡΕΣΙΕΣ", "ΟΧΙ_ΥΠΗΡΕΣΙΕΣ", "ΑΠΑΓΟΡΕΥΜΕΝΕΣ ΥΠΗΡΕΣΙΕΣ"],
-    days: ["UNAVAILABLE_DAYS", "UNAVAILABLE", "ΑΔΕΙΑ", "ΜΗ ΔΙΑΘΕΣΙΜΟΣ"], note: ["NOTE", "ΣΗΜΕΙΩΣΗ", "ΠΑΡΑΤΗΡΗΣΕΙΣ"],
+    days: ["UNAVAILABLE_DAYS", "UNAVAILABLE", "ΑΔΕΙΑ", "ΜΗ ΔΙΑΘΕΣΙΜΟΣ", "ΑΛΛΕΣ ΜΕΡΕΣ ΠΟΥ ΛΕΙΠΕΙ"], note: ["NOTE", "ΣΗΜΕΙΩΣΗ", "ΠΑΡΑΤΗΡΗΣΕΙΣ"],
+    leave: ["LEAVE", "ΑΔΕΙΑ ΑΠΟ-ΕΩΣ", "ΑΔΕΙΑ ΑΠΟ ΕΩΣ", "ΑΔΕΙΕΣ"], detached: ["DETACHED", "ΑΠΟΣΠΑΣΗ", "ΑΠΟΣΠΑΣΗ ΑΠΟ-ΕΩΣ", "ΑΠΟΣΠΑΣΗ ΑΠΟ ΕΩΣ"],
   };
   function headerKey(h) {
     const t = norm(h).replace(/_/g, " ");
@@ -1264,7 +1326,10 @@ details summary { cursor: pointer; font-weight: 600; }
         if (!name) return;
         rules[name] = { unarmed: E.parseBool(o.unarmed, false), no24h: E.parseBool(o.no24h, false),
           shifts: String(o.shifts || ""), tasks: String(o.tasks || ""),
-          days: o.days instanceof Date ? fmtDate(E.excelDateToIso(o.days)) : String(o.days || ""), note: String(o.note || "") };
+          days: o.days instanceof Date ? fmtDate(E.excelDateToIso(o.days)) : String(o.days || ""),
+          leave: o.leave instanceof Date ? fmtDate(E.excelDateToIso(o.leave)) : String(o.leave || ""),
+          detached: o.detached instanceof Date ? fmtDate(E.excelDateToIso(o.detached)) : String(o.detached || ""),
+          note: String(o.note || "") };
       });
     }
     const seen = new Set();
@@ -1878,9 +1943,15 @@ details summary { cursor: pointer; font-weight: 600; }
 
   /* The quarter of each rank with the fewest hours (at least one, and only if really behind the average):
      shown in bold - they are next, so the hours even out. Same rule as Άτομα.xlsx of the PC. */
-  function fewestHours(history, people) {
-    const hours = new Map(people.map(p => [norm(p.name), 0]));
-    for (const e of history.entries) { const k = norm(e.worker); if (hours.has(k)) hours.set(k, hours.get(k) + (+e.hours || 0)); }
+  function fewestHours(history, people, rules) {
+    const hours = new Map(people.map(p => [norm(p.name), 0])), n = new Map();
+    for (const e of history.entries) { const k = norm(e.worker); if (hours.has(k)) { hours.set(k, hours.get(k) + (+e.hours || 0)); n.set(k, (n.get(k) || 0) + 1); } }
+    const last = E.lastDate(history);
+    if (rules && last) for (const p of people) {  // απόσπαση counts as duties done (same credit as the engine)
+      const k = norm(p.name), rng = E.parseRanges((rules[p.name] || {}).detached, last);
+      const days = rng.reduce((a, [f, t]) => a + (last >= f ? E.diffDays(last < t ? last : t, f) + 1 : 0), 0);
+      if (days) hours.set(k, hours.get(k) + days * E.CONFIG.detachedPerWeek / 7 * (n.get(k) ? hours.get(k) / n.get(k) : 24));
+    }
     const byRank = new Map();
     for (const p of people) { const g = rankKey(p.rank || E.CONFIG.defaultRank); if (!byRank.has(g)) byRank.set(g, []); byRank.get(g).push(hours.get(norm(p.name))); }
     const out = new Set();
@@ -1909,7 +1980,7 @@ details summary { cursor: pointer; font-weight: 600; }
     const exempt = name => {
       const r = rules[name] || {};
       return [r.unarmed ? "ΑΟΠΛΟΣ" : "", r.no24h ? "όχι 24ωρες" : "", r.shifts ? `όχι ώρες: ${r.shifts}` : "", r.tasks ? `όχι: ${r.tasks}` : "",
-        r.days ? `άδεια: ${r.days}` : ""].filter(Boolean).join(" · ");
+        r.days ? `λείπει: ${r.days}` : "", r.leave ? `άδεια: ${r.leave}` : "", r.detached ? `απόσπαση: ${r.detached}` : ""].filter(Boolean).join(" · ");
     };
     const served = new Set(history.served);
     // ---- Ονόματα
@@ -1930,7 +2001,7 @@ details summary { cursor: pointer; font-weight: 600; }
     heads.forEach((t, i) => { ws.getCell(hr, i + 1).value = t; });
     header(ws, hr, heads.length, 46);
     const order = [...display.keys()].sort((a, b) => (active.has(b) - active.has(a)) || rankSort(display.get(a)[1]) - rankSort(display.get(b)[1]) || display.get(a)[0].localeCompare(display.get(b)[0]));
-    const behind = fewestHours(history, people);
+    const behind = fewestHours(history, people, rules);
     order.forEach((k, i) => {
       const ents = byWorker.get(k) || [];
       let [name, rank] = display.get(k);
@@ -2050,7 +2121,7 @@ details summary { cursor: pointer; font-weight: 600; }
   root.Excel = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);
 
-window.HELP = {"title": "Υπηρεσίες - Οδηγίες χρήσης", "sections": [{"title": "Τι κάνει", "intro": "Βγάζει το πρόγραμμα υπηρεσιών (ημερήσιο ή εβδομαδιαίο) με δίκαιη σειρά για όλους. Κάθε υπηρεσία την κάνει μόνο όποιος έχει τον σωστό βαθμό, κανείς δεν παίρνει κολλητές βάρδιες, και όλοι μπαίνουν με τη σειρά. Βγάζει δύο Excel: το έντυπο με τις υπηρεσίες (για εκτύπωση) και το Άτομα.xlsx, που γράφει ποιος έκανε τι.", "items": [], "numbered": false}, {"title": "Τα 4 βήματα για να βγάλεις πρόγραμμα", "items": ["Ονόματα - Άνοιξε το Excel με τα ονόματα. Χρειάζεται δύο στήλες: «Ονοματεπώνυμο» και «Βαθμός» (ΣΤΡ, ΔΝΕΑΣ, ΕΠΧΙΑΣ...). Όποιος δεν έχει βαθμό θεωρείται ΣΤΡ. Μπορείς και να γράψεις ονόματα ένα-ένα.", "Υπηρεσίες - Όλες οι υπηρεσίες του εντύπου υπάρχουν ως «προτεινόμενες», αλλά ξεκινούν ανενεργές. Ανέβασε το άδειο έντυπο της μονάδας σαν «Πρότυπο» και ενεργοποιούνται μόνες τους όσες έχει. Ή ενεργοποίησε εσύ όσες θέλεις (το «+» στο κινητό, κλικ στο ☐ στον υπολογιστή). Μπορείς και να φτιάξεις νέες (δες «Πώς φτιάχνεις νέα υπηρεσία»).", "Εξαιρέσεις - Για όποιον χρειάζεται: άοπλος, όχι πρωινές ή βραδινές, όχι 24ωρες, άδεια, υπηρεσίες που δεν κάνει (δες «Πώς δουλεύουν οι εξαιρέσεις»).", "Βγάλε πρόγραμμα - Διάλεξε «Ημερήσιο» ή «Εβδομαδιαίο» και από ποια μέρα, και πάτα «Βγάλε πρόγραμμα». Κατέβασε το Excel με τις υπηρεσίες για να το τυπώσεις και κράτα το Άτομα.xlsx."], "numbered": true, "note": "Την επόμενη φορά συνεχίζει μόνο του από την επόμενη μέρα, με τη σειρά που έμεινε."}, {"title": "Κανόνες που δεν σπάνε ποτέ", "items": ["Μία υπηρεσία τη μέρα - κανείς δεν παίρνει 2 διαφορετικές υπηρεσίες την ίδια μέρα. Αν δεν φτάνουν τα άτομα, η θέση μένει κενή και γράφει «ΔΕΝ ΦΤΑΝΟΥΝ ΤΑ ΑΤΟΜΑ» - δεν μπαίνει κανείς δεύτερη φορά.", "Δύο συνεχόμενες μέρες μόνο αν δεν φτάνουν τα άτομα - κανονικά μπαίνουν το πολύ μέρα παρά μέρα. Αν τα άτομα δεν φτάνουν για να καλυφθούν οι θέσεις, κάποιοι μπαίνουν 2 συνεχόμενες μέρες, με τη σειρά (πρώτα όσοι δεν έχουν ξαναμπεί), και το πρόγραμμα γράφει ότι οι υπηρεσίες είναι περισσότερες από τα άτομα.", "Φυλάκια το Σαββατοκύριακο - είναι τριήμερο: όποιος πάει Παρασκευή μένει Σάββατο και Κυριακή και γυρνάει Δευτέρα πρωί (τη Δευτέρα δεν παίρνει υπηρεσία). Αλλάζει με το «Τριήμερο ΣΚ» σε κάθε υπηρεσία.", "Βαθμός - κάθε υπηρεσία την κάνει μόνο όποιος έχει τον βαθμό που επιτρέπει (π.χ. το ΑΥΔΜ ποτέ ΣΤΡ).", "Εξαιρέσεις και άδειες - ο άοπλος δεν μπαίνει ποτέ σε ένοπλη, κανείς δεν μπαίνει σε ώρες ή μέρες που έχει εξαίρεση ή άδεια.", "Ίδια ώρα - κανείς δεν έχει δύο βάρδιες που πέφτουν την ίδια ώρα."], "numbered": false, "note": "Δεν μετράνε σαν δεύτερη υπηρεσία: οι εβδομαδιαίες (ΑΓΟΣ / ΑΝΘΣΤΗΣ ΕΒΔΟΜΑΔΑΣ) και οι θέσεις που είναι «ίδιος με» ή «από» άλλη υπηρεσία (π.χ. ΟΔΗΓΟΣ Φ/Φ, πληρώματα οχημάτων, ΑΜ 2) - αυτές τις κάνει ο ίδιος άνθρωπος μαζί με την υπηρεσία του."}, {"title": "Πώς δουλεύουν οι εξαιρέσεις", "intro": "Στο κινητό: καρτέλα «Ονόματα» και πατάς πάνω στο όνομα. Στον υπολογιστή: κουμπί «Εξαιρέσεις».", "items": ["Άοπλος - δεν μπαίνει ποτέ σε ένοπλη υπηρεσία. Στις άοπλες υπηρεσίες μπαίνει πρώτος.", "Όχι πρωινές / απογευματινές / βραδινές / νυχτερινές - δεν μπαίνει σε υπηρεσία που πέφτει σε αυτές τις ώρες (πρωί 06-12, απόγευμα 12-18, βράδυ 18-24, νύχτα 00-06). Στο «Άλλες ώρες» γράφεις δικές σου, π.χ. 22:00-02:00.", "Όχι 24ωρες - δεν μπαίνει σε 24ωρες ή εβδομαδιαίες υπηρεσίες.", "Υπηρεσίες που δεν κάνει - τσεκάρεις όσες δεν μπορεί να κάνει.", "Άδεια / απουσία - μέρες (π.χ. Σάββατο, Κυριακή) ή ημερομηνίες (π.χ. 18/11/2026) που λείπει. Εκείνες τις μέρες δεν μπαίνει πουθενά.", "Σημείωση - ό,τι θέλεις να θυμάσαι (δεν επηρεάζει το πρόγραμμα)."], "numbered": false, "note": "Κάτω-κάτω γράφει αμέσως ποιες υπηρεσίες μπορεί ακόμα να κάνει. Αν γράψει «καμία», οι εξαιρέσεις είναι πολλές."}, {"title": "Πώς φτιάχνεις νέα υπηρεσία", "items": ["Άνοιξε - «Υπηρεσίες» και μετά «+ Νέα υπηρεσία» (ή «Από τις προτεινόμενες» για μία του εντύπου).", "Τίτλος - π.χ. ΣΚΟΠΟΣ ΑΠΟΘΗΚΗΣ. Αν έχει νούμερα (1ο, 2ο...), γράψ' το στο «Νούμερο».", "Ωράριο - διάλεξε έτοιμο (24ωρη, 3ωρες βάρδιες...) ή γράψε π.χ. 08:00-20:00, ή φτιάξε βάρδιες με «Από» / «Έως» και «+ Βάρδια». Από κάτω γράφει αν κατάλαβε το ωράριο.", "Άτομα και βαθμός - πόσοι τη φορά, και ποιος βαθμός την κάνει (π.χ. ΣΤΡ). Για δύο βαθμούς γράψε τους με κόμμα, π.χ. «ΔΝΕΑΣ, ΣΤΡ».", "Ένοπλη - τσέκαρέ το αν είναι ένοπλη, για να μη μπαίνουν άοπλοι.", "Ποιοι την κάνουν - «Όλοι του βαθμού» (με τη σειρά), «Σταθερό άτομο» (π.χ. στο ΚΨΜ μπαίνει πάντα ο ίδιος) ή «Μόνο από συγκεκριμένους» (διαλέγει μόνο ανάμεσα σε όσους τσεκάρεις).", "Στο έντυπο - «Στήλη εντύπου» (αριστερή ή δεξιά) και «Επικεφαλίδα»: πού θα τυπωθεί.", "Αποθήκευση - και είναι έτοιμη. Για να μη βγαίνει για λίγο καιρό, κάν' την ανενεργή αντί να τη σβήσεις."], "numbered": true}, {"title": "Πώς μοιράζει τις υπηρεσίες", "items": ["Γύρος - όλοι του ίδιου βαθμού κάνουν από μία υπηρεσία πριν ξαναμπεί κάποιος. Όταν κάνουν όλοι, ξεκινά νέος γύρος με τυχαία σειρά. Κάθε βαθμός έχει δικό του γύρο.", "Ξεκούραση - μία υπηρεσία τη μέρα το πολύ, μέρα παρά μέρα (δύο συνεχόμενες μόνο αν δεν φτάνουν τα άτομα), και όσο γίνεται χωρίς κολλητές βάρδιες.", "Ποικιλία - προσπαθεί να μην πιάνει κάποιος την ίδια υπηρεσία ξανά μέσα στην εβδομάδα, ώστε να περνούν όλοι από όλες.", "Ίσες ώρες - μοιράζει τις μεγάλες υπηρεσίες (24ωρες) σε όσους έχουν κάνει λιγότερες ώρες. Στο Άτομα.xlsx όσοι έχουν τις λιγότερες ώρες στον βαθμό τους φαίνονται με έντονα - αυτοί μπαίνουν πρώτοι.", "Ίδια υπηρεσία ξανά - επιτρέπεται όταν δεν φτάνουν τα άτομα. Τότε μπαίνει όποιος έχει τις λιγότερες ώρες.", "Σαββατοκύριακα (ΣΤΡ) - μπαίνουν πρώτα όσοι έχουν κάνει τα λιγότερα Σαββατοκύριακα.", "Δεν φτάνουν τα άτομα - αν μια μέρα δεν υπάρχει ελεύθερος, η θέση μένει κενή με «ΔΕΝ ΦΤΑΝΟΥΝ ΤΑ ΑΤΟΜΑ». Αν στο σύνολο οι υπηρεσίες είναι περισσότερες από τα άτομα, όλοι ξαναμπαίνουν πιο συχνά με τη σειρά."], "numbered": false}, {"title": "Πρότυπο Excel (το έντυπο της μονάδας)", "items": ["Τι είναι - το άδειο Excel της μονάδας με τη φόρμα που θέλετε (διάταξη, σημειώσεις, υπογραφές). Το πρόγραμμα βγαίνει πάνω σε αυτό, ίδιο ακριβώς, με τα ονόματα στις θέσεις τους.", "Τι πρέπει να έχει - μια γραμμή επικεφαλίδας με «ΩΡΑΡΙΟ», «ΒΑΘΜΟΣ» και «ΟΝΟΜΑ» (ή «ΟΝΟΜΑΤΕΠΩΝΥΜΟ») για κάθε στήλη. Κάτω από αυτήν, κάθε γραμμή με τίτλο και ωράριο είναι μια υπηρεσία (ενωμένες γραμμές = περισσότερα άτομα).", "Πώς το βάζεις - κουμπί «Πρότυπο» και διαλέγεις το αρχείο. Γράφει ποιες υπηρεσίες βρήκε, ποιες είναι νέες και ποιες λείπουν, και πατάς «Χρήση».", "Ποιες γίνονται ενεργές - όσες βρει στο πρότυπο γίνονται ενεργές μόνες τους. Όσες δεν έχει μένουν προτεινόμενες (ανενεργές) και τις ενεργοποιείς μόνο αν τις θέλεις.", "Νέες υπηρεσίες - όσες προσθέτεις μετά στην εφαρμογή μπαίνουν μόνες τους στο Excel, κάτω από τις υπόλοιπες της ίδιας στήλης. Το πρότυπο δεν χρειάζεται να το αλλάξεις."], "numbered": false}, {"title": "Ιστορικό (Άτομα.xlsx)", "items": ["Τι γράφει - δίπλα σε κάθε όνομα πόσες και ποιες υπηρεσίες έκανε, τις ώρες, και αν έκανε στον τωρινό γύρο («ΕΚΑΝΕ») ή αν έρχεται η σειρά του («ΣΕΙΡΑ ΤΟΥ ΣΥΝΤΟΜΑ»).", "Ξανά οι ίδιες μέρες - αν ξαναβγάλεις μέρες που έχουν ήδη βγει, ρωτάει πρώτα και μετά τις αντικαθιστά.", "Κινητό και υπολογιστής - το ίδιο αρχείο ανοίγει και στα δύο: κατέβασέ το από το ένα και φόρτωσέ το στο άλλο («Ιστορικό» στο κινητό).", "Αντίγραφο - κράτα αντίγραφο. Στο κινητό τα στοιχεία μένουν μόνο σε αυτό το κινητό."], "numbered": false}, {"title": "Τι σημαίνουν τα μηνύματα", "items": ["ΔΕΝ ΦΤΑΝΟΥΝ ΤΑ ΑΤΟΜΑ (κενή θέση) - εκείνη τη μέρα όσοι μπορούν να την κάνουν έχουν ήδη υπηρεσία ή εξαίρεση/άδεια, και κανείς δεν μπαίνει σε 2 υπηρεσίες. Συμπλήρωσέ τη με το χέρι, πρόσθεσε άτομα, λιγότερες εξαιρέσεις ή κλείσε κάποια υπηρεσία.", "Κανένας με αυτό τον βαθμό - δεν υπάρχει κανείς με αυτόν τον βαθμό στη λίστα. Άλλαξε τον βαθμό της υπηρεσίας ή πρόσθεσε άτομα.", "Κίτρινο όνομα / χαλάρωση - μπήκε επειδή δεν υπήρχε άλλος, π.χ. με λίγη ξεκούραση από την προηγούμενη βάρδια. Τις βλέπεις στις «Προειδοποιήσεις» (στο Excel: φύλλο Warnings).", "Δεν φτάνουν τα άτομα (ΣΤΡ) - οι υπηρεσίες των ΣΤΡ είναι περισσότερες από τους ΣΤΡ, οπότε ξαναμπαίνουν όλοι πιο συχνά και, αν χρειαστεί, κάποιοι 2 συνεχόμενες μέρες (με τη σειρά)."], "numbered": false}, {"title": "Νομικά, απόρρητο και ασφάλεια", "items": ["Ανεπίσημη εφαρμογή - δεν είναι επίσημη εφαρμογή του Ελληνικού Στρατού, του ΓΕΣ ή του Υπουργείου Εθνικής Άμυνας και δεν συνδέεται με αυτούς. Είναι βοήθημα για όποιον φτιάχνει το πρόγραμμα υπηρεσιών.", "Το πρόγραμμα είναι πρόταση - το ελέγχει και το εγκρίνει ο αρμόδιος (π.χ. ο Διοικητής) πριν εφαρμοστεί. Ισχύει ό,τι υπογράφεται, όχι ό,τι βγάζει η εφαρμογή.", "Χωρίς εγγύηση - η εφαρμογή δίνεται «ως έχει». Ο δημιουργός δεν ευθύνεται για λάθη στο πρόγραμμα, για χαμένα δεδομένα ή για τον τρόπο που χρησιμοποιείται.", "Τα δεδομένα μένουν στη συσκευή - ονόματα, βαθμοί, εξαιρέσεις και ιστορικό αποθηκεύονται μόνο στο κινητό ή στον υπολογιστή και στα Excel που κατεβάζεις. Η εφαρμογή δεν στέλνει τίποτα στο ίντερνετ: δεν έχει λογαριασμούς, διαφημίσεις ή στατιστικά. Με την απεγκατάσταση σβήνουν.", "Προσωπικά δεδομένα (GDPR) - τα ονόματα είναι προσωπικά δεδομένα. Υπεύθυνος για τη χρήση τους είναι η μονάδα και όποιος τα βάζει (Κανονισμός ΕΕ 2016/679, ν. 4624/2019). Βάλε μόνο ό,τι χρειάζεται για τις υπηρεσίες. ΜΗΝ γράφεις λόγους υγείας ή ιατρικά στοιχεία: γράψε μόνο «άοπλος», «όχι 24ωρες» κτλ.", "Ασφάλεια μονάδας - μη βάζεις διαβαθμισμένες πληροφορίες. Μη μοιράζεσαι τα Excel με τις υπηρεσίες εκτός μονάδας (π.χ. σε ανοιχτές ομάδες). Τήρησε τις εντολές της μονάδας για κινητά και αρχεία.", "Άδειες λογισμικού - η εφαρμογή χρησιμοποιεί ελεύθερο λογισμικό: ExcelJS (MIT, © 2014-2019 Guyon Roche), openpyxl (MIT), Python (PSF), AndroidX (Apache 2.0). Τα πλήρη κείμενα των αδειών είναι στο τέλος των Οδηγιών (κινητό) και στο ΑΔΕΙΕΣ.txt (υπολογιστής)."], "numbered": false}]};
+window.HELP = {"title": "Υπηρεσίες - Οδηγίες χρήσης", "sections": [{"title": "Τι κάνει", "intro": "Βγάζει το πρόγραμμα υπηρεσιών (ημερήσιο ή εβδομαδιαίο) με δίκαιη σειρά για όλους. Κάθε υπηρεσία την κάνει μόνο όποιος έχει τον σωστό βαθμό, κανείς δεν παίρνει κολλητές βάρδιες, και όλοι μπαίνουν με τη σειρά. Βγάζει δύο Excel: το έντυπο με τις υπηρεσίες (για εκτύπωση) και το Άτομα.xlsx, που γράφει ποιος έκανε τι.", "items": [], "numbered": false}, {"title": "Τα 4 βήματα για να βγάλεις πρόγραμμα", "items": ["Ονόματα - Άνοιξε το Excel με τα ονόματα. Χρειάζεται δύο στήλες: «Ονοματεπώνυμο» και «Βαθμός» (ΣΤΡ, ΔΝΕΑΣ, ΕΠΧΙΑΣ...). Όποιος δεν έχει βαθμό θεωρείται ΣΤΡ. Μπορείς και να γράψεις ονόματα ένα-ένα.", "Υπηρεσίες - Όλες οι υπηρεσίες του εντύπου υπάρχουν ως «προτεινόμενες», αλλά ξεκινούν ανενεργές. Ανέβασε το άδειο έντυπο της μονάδας σαν «Πρότυπο» και ενεργοποιούνται μόνες τους όσες έχει. Ή ενεργοποίησε εσύ όσες θέλεις (το «+» στο κινητό, κλικ στο ☐ στον υπολογιστή). Μπορείς και να φτιάξεις νέες (δες «Πώς φτιάχνεις νέα υπηρεσία»).", "Εξαιρέσεις - Για όποιον χρειάζεται: άοπλος, όχι πρωινές ή βραδινές, όχι 24ωρες, άδεια, υπηρεσίες που δεν κάνει (δες «Πώς δουλεύουν οι εξαιρέσεις»).", "Βγάλε πρόγραμμα - Διάλεξε «Ημερήσιο» ή «Εβδομαδιαίο» και από ποια μέρα, και πάτα «Βγάλε πρόγραμμα». Κατέβασε το Excel με τις υπηρεσίες για να το τυπώσεις και κράτα το Άτομα.xlsx."], "numbered": true, "note": "Την επόμενη φορά συνεχίζει μόνο του από την επόμενη μέρα, με τη σειρά που έμεινε."}, {"title": "Κανόνες που δεν σπάνε ποτέ", "items": ["Μία υπηρεσία τη μέρα - κανείς δεν παίρνει 2 διαφορετικές υπηρεσίες την ίδια μέρα. Αν δεν φτάνουν τα άτομα, η θέση μένει κενή και γράφει «ΔΕΝ ΦΤΑΝΟΥΝ ΤΑ ΑΤΟΜΑ» - δεν μπαίνει κανείς δεύτερη φορά.", "Δύο συνεχόμενες μέρες μόνο αν δεν φτάνουν τα άτομα - κανονικά μπαίνουν το πολύ μέρα παρά μέρα. Αν τα άτομα δεν φτάνουν για να καλυφθούν οι θέσεις, κάποιοι μπαίνουν 2 συνεχόμενες μέρες, με τη σειρά (πρώτα όσοι δεν έχουν ξαναμπεί), και το πρόγραμμα γράφει ότι οι υπηρεσίες είναι περισσότερες από τα άτομα.", "Φυλάκια το Σαββατοκύριακο - είναι τριήμερο: όποιος πάει Παρασκευή μένει Σάββατο και Κυριακή και γυρνάει Δευτέρα πρωί (τη Δευτέρα δεν παίρνει υπηρεσία). Αλλάζει με το «Τριήμερο ΣΚ» σε κάθε υπηρεσία.", "Βαθμός - κάθε υπηρεσία την κάνει μόνο όποιος έχει τον βαθμό που επιτρέπει (π.χ. το ΑΥΔΜ ποτέ ΣΤΡ).", "Εξαιρέσεις και άδειες - ο άοπλος δεν μπαίνει ποτέ σε ένοπλη, κανείς δεν μπαίνει σε ώρες ή μέρες που έχει εξαίρεση ή άδεια.", "Ίδια ώρα - κανείς δεν έχει δύο βάρδιες που πέφτουν την ίδια ώρα."], "numbered": false, "note": "Δεν μετράνε σαν δεύτερη υπηρεσία: οι εβδομαδιαίες (ΑΓΟΣ / ΑΝΘΣΤΗΣ ΕΒΔΟΜΑΔΑΣ) και οι θέσεις που είναι «ίδιος με» ή «από» άλλη υπηρεσία (π.χ. ΟΔΗΓΟΣ Φ/Φ, πληρώματα οχημάτων, ΑΜ 2) - αυτές τις κάνει ο ίδιος άνθρωπος μαζί με την υπηρεσία του."}, {"title": "Πώς δουλεύουν οι εξαιρέσεις", "intro": "Στο κινητό: καρτέλα «Ονόματα» και πατάς πάνω στο όνομα. Στον υπολογιστή: κουμπί «Εξαιρέσεις».", "items": ["Άοπλος - δεν μπαίνει ποτέ σε ένοπλη υπηρεσία. Στις άοπλες υπηρεσίες μπαίνει πρώτος.", "Όχι πρωινές / απογευματινές / βραδινές / νυχτερινές - δεν μπαίνει σε υπηρεσία που πέφτει σε αυτές τις ώρες (πρωί 06-12, απόγευμα 12-18, βράδυ 18-24, νύχτα 00-06). Στο «Άλλες ώρες» γράφεις δικές σου, π.χ. 22:00-02:00.", "Όχι 24ωρες - δεν μπαίνει σε 24ωρες ή εβδομαδιαίες υπηρεσίες.", "Υπηρεσίες που δεν κάνει - τσεκάρεις όσες δεν μπορεί να κάνει.", "Άδεια - γράφεις από-έως (π.χ. 20/11/2026-24/11/2026). Εκείνες τις μέρες δεν μπαίνει υπηρεσία. Όταν γυρίσει, αν έχει μείνει πίσω σε υπηρεσίες, μπαίνει πρώτος μέχρι να φτάσει τους άλλους (μέρα παρά μέρα - ισχύει για ΣΤΡ). Αν δεν είναι πίσω, συνεχίζει κανονικά.", "Απόσπαση - γράφεις από-έως. Δεν μπαίνει υπηρεσία ούτε στις υπηρεσίες «μόνο από». Μετράει σαν να έκανε υπηρεσίες: 1 εβδομάδα = 3 υπηρεσίες (λιγότερες μέρες αναλογικά), οπότε όταν γυρίσει δεν χρειάζεται να «φτάσει» τους άλλους.", "Άλλες μέρες που λείπει - μέρες (π.χ. Σάββατο, Κυριακή) ή ημερομηνίες (π.χ. 18/11/2026). Εκείνες τις μέρες δεν μπαίνει πουθενά.", "Σημείωση - ό,τι θέλεις να θυμάσαι (δεν επηρεάζει το πρόγραμμα)."], "numbered": false, "note": "Κάτω-κάτω γράφει αμέσως ποιες υπηρεσίες μπορεί ακόμα να κάνει. Αν γράψει «καμία», οι εξαιρέσεις είναι πολλές."}, {"title": "Πώς φτιάχνεις νέα υπηρεσία", "items": ["Άνοιξε - «Υπηρεσίες» και μετά «+ Νέα υπηρεσία» (ή «Από τις προτεινόμενες» για μία του εντύπου).", "Τίτλος - π.χ. ΣΚΟΠΟΣ ΑΠΟΘΗΚΗΣ. Αν έχει νούμερα (1ο, 2ο...), γράψ' το στο «Νούμερο».", "Ωράριο - διάλεξε έτοιμο (24ωρη, 3ωρες βάρδιες...) ή γράψε π.χ. 08:00-20:00, ή φτιάξε βάρδιες με «Από» / «Έως» και «+ Βάρδια». Από κάτω γράφει αν κατάλαβε το ωράριο.", "Άτομα και βαθμός - πόσοι τη φορά, και ποιος βαθμός την κάνει (π.χ. ΣΤΡ). Για δύο βαθμούς γράψε τους με κόμμα, π.χ. «ΔΝΕΑΣ, ΣΤΡ».", "Ένοπλη - τσέκαρέ το αν είναι ένοπλη, για να μη μπαίνουν άοπλοι.", "Ποιοι την κάνουν - «Όλοι του βαθμού» (με τη σειρά), «Σταθερό άτομο» (π.χ. στο ΚΨΜ μπαίνει πάντα ο ίδιος) ή «Μόνο από συγκεκριμένους» (διαλέγει μόνο ανάμεσα σε όσους τσεκάρεις).", "Στο έντυπο - «Στήλη εντύπου» (αριστερή ή δεξιά) και «Επικεφαλίδα»: πού θα τυπωθεί.", "Αποθήκευση - και είναι έτοιμη. Για να μη βγαίνει για λίγο καιρό, κάν' την ανενεργή αντί να τη σβήσεις."], "numbered": true}, {"title": "Πώς μοιράζει τις υπηρεσίες", "items": ["Γύρος - όλοι του ίδιου βαθμού κάνουν από μία υπηρεσία πριν ξαναμπεί κάποιος. Όταν κάνουν όλοι, ξεκινά νέος γύρος με τυχαία σειρά. Κάθε βαθμός έχει δικό του γύρο.", "Ξεκούραση - μία υπηρεσία τη μέρα το πολύ, μέρα παρά μέρα (δύο συνεχόμενες μόνο αν δεν φτάνουν τα άτομα), και όσο γίνεται χωρίς κολλητές βάρδιες.", "Ποικιλία - προσπαθεί να μην πιάνει κάποιος την ίδια υπηρεσία ξανά μέσα στην εβδομάδα, ώστε να περνούν όλοι από όλες.", "Ίσες ώρες - μοιράζει τις μεγάλες υπηρεσίες (24ωρες) σε όσους έχουν κάνει λιγότερες ώρες. Στο Άτομα.xlsx όσοι έχουν τις λιγότερες ώρες στον βαθμό τους φαίνονται με έντονα - αυτοί μπαίνουν πρώτοι.", "Ίδια υπηρεσία ξανά - επιτρέπεται όταν δεν φτάνουν τα άτομα. Τότε μπαίνει όποιος έχει τις λιγότερες ώρες.", "Σαββατοκύριακα (ΣΤΡ) - μπαίνουν πρώτα όσοι έχουν κάνει τα λιγότερα Σαββατοκύριακα.", "Δεν φτάνουν τα άτομα - αν μια μέρα δεν υπάρχει ελεύθερος, η θέση μένει κενή με «ΔΕΝ ΦΤΑΝΟΥΝ ΤΑ ΑΤΟΜΑ». Αν στο σύνολο οι υπηρεσίες είναι περισσότερες από τα άτομα, όλοι ξαναμπαίνουν πιο συχνά με τη σειρά."], "numbered": false}, {"title": "Πρότυπο Excel (το έντυπο της μονάδας)", "items": ["Τι είναι - το άδειο Excel της μονάδας με τη φόρμα που θέλετε (διάταξη, σημειώσεις, υπογραφές). Το πρόγραμμα βγαίνει πάνω σε αυτό, ίδιο ακριβώς, με τα ονόματα στις θέσεις τους.", "Τι πρέπει να έχει - μια γραμμή επικεφαλίδας με «ΩΡΑΡΙΟ», «ΒΑΘΜΟΣ» και «ΟΝΟΜΑ» (ή «ΟΝΟΜΑΤΕΠΩΝΥΜΟ») για κάθε στήλη. Κάτω από αυτήν, κάθε γραμμή με τίτλο και ωράριο είναι μια υπηρεσία (ενωμένες γραμμές = περισσότερα άτομα).", "Πώς το βάζεις - κουμπί «Πρότυπο» και διαλέγεις το αρχείο. Γράφει ποιες υπηρεσίες βρήκε, ποιες είναι νέες και ποιες λείπουν, και πατάς «Χρήση».", "Ποιες γίνονται ενεργές - όσες βρει στο πρότυπο γίνονται ενεργές μόνες τους. Όσες δεν έχει μένουν προτεινόμενες (ανενεργές) και τις ενεργοποιείς μόνο αν τις θέλεις.", "Νέες υπηρεσίες - όσες προσθέτεις μετά στην εφαρμογή μπαίνουν μόνες τους στο Excel, κάτω από τις υπόλοιπες της ίδιας στήλης. Το πρότυπο δεν χρειάζεται να το αλλάξεις."], "numbered": false}, {"title": "Ιστορικό (Άτομα.xlsx)", "items": ["Τι γράφει - δίπλα σε κάθε όνομα πόσες και ποιες υπηρεσίες έκανε, τις ώρες, και αν έκανε στον τωρινό γύρο («ΕΚΑΝΕ») ή αν έρχεται η σειρά του («ΣΕΙΡΑ ΤΟΥ ΣΥΝΤΟΜΑ»).", "Ξανά οι ίδιες μέρες - αν ξαναβγάλεις μέρες που έχουν ήδη βγει, ρωτάει πρώτα και μετά τις αντικαθιστά.", "Κινητό και υπολογιστής - το ίδιο αρχείο ανοίγει και στα δύο: κατέβασέ το από το ένα και φόρτωσέ το στο άλλο («Ιστορικό» στο κινητό).", "Αντίγραφο - κράτα αντίγραφο. Στο κινητό τα στοιχεία μένουν μόνο σε αυτό το κινητό."], "numbered": false}, {"title": "Τι σημαίνουν τα μηνύματα", "items": ["ΔΕΝ ΦΤΑΝΟΥΝ ΤΑ ΑΤΟΜΑ (κενή θέση) - εκείνη τη μέρα όσοι μπορούν να την κάνουν έχουν ήδη υπηρεσία ή εξαίρεση/άδεια, και κανείς δεν μπαίνει σε 2 υπηρεσίες. Συμπλήρωσέ τη με το χέρι, πρόσθεσε άτομα, λιγότερες εξαιρέσεις ή κλείσε κάποια υπηρεσία.", "Κανένας με αυτό τον βαθμό - δεν υπάρχει κανείς με αυτόν τον βαθμό στη λίστα. Άλλαξε τον βαθμό της υπηρεσίας ή πρόσθεσε άτομα.", "Κίτρινο όνομα / χαλάρωση - μπήκε επειδή δεν υπήρχε άλλος, π.χ. με λίγη ξεκούραση από την προηγούμενη βάρδια. Τις βλέπεις στις «Προειδοποιήσεις» (στο Excel: φύλλο Warnings).", "Δεν φτάνουν τα άτομα (ΣΤΡ) - οι υπηρεσίες των ΣΤΡ είναι περισσότερες από τους ΣΤΡ, οπότε ξαναμπαίνουν όλοι πιο συχνά και, αν χρειαστεί, κάποιοι 2 συνεχόμενες μέρες (με τη σειρά)."], "numbered": false}, {"title": "Νομικά, απόρρητο και ασφάλεια", "items": ["Ανεπίσημη εφαρμογή - δεν είναι επίσημη εφαρμογή του Ελληνικού Στρατού, του ΓΕΣ ή του Υπουργείου Εθνικής Άμυνας και δεν συνδέεται με αυτούς. Είναι βοήθημα για όποιον φτιάχνει το πρόγραμμα υπηρεσιών.", "Το πρόγραμμα είναι πρόταση - το ελέγχει και το εγκρίνει ο αρμόδιος (π.χ. ο Διοικητής) πριν εφαρμοστεί. Ισχύει ό,τι υπογράφεται, όχι ό,τι βγάζει η εφαρμογή.", "Χωρίς εγγύηση - η εφαρμογή δίνεται «ως έχει». Ο δημιουργός δεν ευθύνεται για λάθη στο πρόγραμμα, για χαμένα δεδομένα ή για τον τρόπο που χρησιμοποιείται.", "Τα δεδομένα μένουν στη συσκευή - ονόματα, βαθμοί, εξαιρέσεις και ιστορικό αποθηκεύονται μόνο στο κινητό ή στον υπολογιστή και στα Excel που κατεβάζεις. Η εφαρμογή δεν στέλνει τίποτα στο ίντερνετ: δεν έχει λογαριασμούς, διαφημίσεις ή στατιστικά. Με την απεγκατάσταση σβήνουν.", "Προσωπικά δεδομένα (GDPR) - τα ονόματα είναι προσωπικά δεδομένα. Υπεύθυνος για τη χρήση τους είναι η μονάδα και όποιος τα βάζει (Κανονισμός ΕΕ 2016/679, ν. 4624/2019). Βάλε μόνο ό,τι χρειάζεται για τις υπηρεσίες. ΜΗΝ γράφεις λόγους υγείας ή ιατρικά στοιχεία: γράψε μόνο «άοπλος», «όχι 24ωρες» κτλ.", "Ασφάλεια μονάδας - μη βάζεις διαβαθμισμένες πληροφορίες. Μη μοιράζεσαι τα Excel με τις υπηρεσίες εκτός μονάδας (π.χ. σε ανοιχτές ομάδες). Τήρησε τις εντολές της μονάδας για κινητά και αρχεία.", "Άδειες λογισμικού - η εφαρμογή χρησιμοποιεί ελεύθερο λογισμικό: ExcelJS (MIT, © 2014-2019 Guyon Roche), openpyxl (MIT), Python (PSF), AndroidX (Apache 2.0). Τα πλήρη κείμενα των αδειών είναι στο τέλος των Οδηγιών (κινητό) και στο ΑΔΕΙΕΣ.txt (υπολογιστής)."], "numbered": false}]};
 window.LICENSES = "ΑΔΕΙΕΣ ΛΟΓΙΣΜΙΚΟΥ ΤΡΙΤΩΝ / THIRD-PARTY SOFTWARE LICENSES\n=========================================================\n\nΗ εφαρμογή «Υπηρεσίες» χρησιμοποιεί το παρακάτω ελεύθερο λογισμικό.\nThe \"Ypiresies\" app uses the following open-source software.\n\n--------------------------------------------------------------------------\nExcelJS (εφαρμογή κινητού - Excel) - https://github.com/exceljs/exceljs\n--------------------------------------------------------------------------\nThe MIT License (MIT)\n\nCopyright (c) 2014-2019 Guyon Roche\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n\n\n--------------------------------------------------------------------------\nopenpyxl (πρόγραμμα υπολογιστή - Excel) - https://openpyxl.readthedocs.io\n--------------------------------------------------------------------------\nThe MIT License (MIT)\n\nCopyright (c) 2010 openpyxl\n\nPermission is hereby granted, free of charge, to any person obtaining a copy of this software and\nassociated documentation files (the \"Software\"), to deal in the Software without restriction, including\nwithout limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the\nfollowing conditions:\n\nThe above copyright notice and this permission notice shall be included in all copies or substantial\nportions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT\nLIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO\nEVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER\nIN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE\nUSE OR OTHER DEALINGS IN THE SOFTWARE.\n\n--------------------------------------------------------------------------\nPython (πρόγραμμα υπολογιστή) - https://www.python.org\n--------------------------------------------------------------------------\nPython Software Foundation License Version 2.\nCopyright (c) 2001 Python Software Foundation. All rights reserved.\nFull text: https://docs.python.org/3/license.html\n\n--------------------------------------------------------------------------\nPyInstaller (πρόγραμμα υπολογιστή - δημιουργία .exe) - https://pyinstaller.org\n--------------------------------------------------------------------------\nGNU General Public License v2 with the PyInstaller bootloader exception: programs built with\nPyInstaller may be distributed under any license. Full text: https://github.com/pyinstaller/pyinstaller/blob/develop/COPYING.txt\n\n--------------------------------------------------------------------------\nAndroidX (εφαρμογή Android: androidx.webkit, androidx.core) - https://developer.android.com/jetpack/androidx\n--------------------------------------------------------------------------\nCopyright The Android Open Source Project.\nLicensed under the Apache License, Version 2.0 (the \"License\"); you may not use this software except in\ncompliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0\nUnless required by applicable law or agreed to in writing, software distributed under the License is\ndistributed on an \"AS IS\" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n";
 </script>
 <script>/* Υπηρεσίες - εφαρμογή για κινητό/browser. Δεδομένα μόνο σε αυτή τη συσκευή (localStorage). */
@@ -2201,11 +2272,12 @@ window.LICENSES = "ΑΔΕΙΕΣ ΛΟΓΙΣΜΙΚΟΥ ΤΡΙΤΩΝ / THIRD-PARTY 
     return [...m].sort((a, b) => E.rankSort(a[0]) - E.rankSort(b[0]));
   }
   const unarmedCount = () => S.people.filter(p => (S.rules[p.name] || {}).unarmed).length;
-  const hasRule = n => { const r = S.rules[n]; return !!r && !!(r.unarmed || r.no24h || r.shifts || r.tasks || r.days); };
+  const hasRule = n => { const r = S.rules[n]; return !!r && !!(r.unarmed || r.no24h || r.shifts || r.tasks || r.days || r.leave || r.detached); };
   function exemptText(n) {
     const r = S.rules[n] || {};
     return [r.unarmed ? "ΑΟΠΛΟΣ" : "", r.no24h ? "όχι 24ωρες" : "", r.shifts ? "όχι ώρες: " + r.shifts : "",
-      r.tasks ? "όχι: " + r.tasks : "", r.days ? "άδεια: " + r.days : ""].filter(Boolean).join(" · ");
+      r.tasks ? "όχι: " + r.tasks : "", r.days ? "λείπει: " + r.days : "", r.leave ? "άδεια: " + r.leave : "",
+      r.detached ? "απόσπαση: " + r.detached : ""].filter(Boolean).join(" · ");
   }
   const fmtRange = v => v.startIso === v.endIso ? E.fmtDate(v.startIso) : `${E.fmtDate(v.startIso, false)} – ${E.fmtDate(v.endIso)}`;
 
@@ -2531,7 +2603,7 @@ window.LICENSES = "ΑΔΕΙΕΣ ΛΟΓΙΣΜΙΚΟΥ ΤΡΙΤΩΝ / THIRD-PARTY 
       <div class="hint">Με <b>έντονα</b>: όσοι έχουν τις λιγότερες ώρες στον βαθμό τους. Αυτοί μπαίνουν πρώτοι, για να βγαίνουν ίσες οι ώρες.</div>
       <input type="search" id="hq" placeholder="Αναζήτηση ονόματος…" value="${esc(ui.hq)}" aria-label="Αναζήτηση ονόματος" autocomplete="off">
       <div class="tablewrap"><table><thead><tr><th>Ονοματεπώνυμο</th><th>Βαθμός</th><th class="num">Σύνολο</th><th class="num">Ώρες</th>${svcs.map(s => `<th class="num">${esc(s)}</th>`).join("")}<th>Γύρος</th><th>Τελευταία</th></tr></thead><tbody>`;
-    const behind = X && X.fewestHours ? X.fewestHours(h, S.people) : new Set();
+    const behind = X && X.fewestHours ? X.fewestHours(h, S.people, S.rules) : new Set();
     rows.forEach(p => {
       const ents = by.get(N(p.name)) || [];
       const hrs = Math.round(ents.reduce((a, e) => a + (+e.hours || 0), 0) * 10) / 10;
@@ -2602,7 +2674,16 @@ window.LICENSES = "ΑΔΕΙΕΣ ΛΟΓΙΣΜΙΚΟΥ ΤΡΙΤΩΝ / THIRD-PARTY 
           <label class="field" for="p-hours">Άλλες ώρες (π.χ. 22:00-02:00)<input type="text" id="p-hours" value="${esc(other)}"></label></fieldset>
         <fieldset style="border:1px solid var(--line);border-radius:10px;padding:8px 12px"><legend class="muted" style="font-size:13px">Υπηρεσίες που ΔΕΝ κάνει</legend>
           <div class="checks">${own.map(s => `<label class="check"><input type="checkbox" data-task="${esc(s)}" ${tasks.has(N(s)) ? "checked" : ""}> ${esc(s)}</label>`).join("") || '<span class="hint">Καμία υπηρεσία για αυτόν τον βαθμό.</span>'}</div></fieldset>
-        <label class="field" for="p-days">Άδεια / απουσία (π.χ. Σάββατο, Κυριακή ή 18/11/2026)<input type="text" id="p-days" value="${esc(rr.days || "")}"></label>
+        <fieldset style="border:1px solid var(--line);border-radius:10px;padding:8px 12px"><legend class="muted" style="font-size:13px">Άδεια &amp; απόσπαση</legend>
+          ${[["leave", "Άδεια", "Δεν μπαίνει υπηρεσία. Όταν γυρίσει, αν είναι πίσω, μπαίνει πρώτος μέχρι να φτάσει τους άλλους (ΣΤΡ)."],
+             ["detached", "Απόσπαση", `Δεν μπαίνει υπηρεσία ούτε στο «μόνο από». Μετράει σαν να έκανε υπηρεσίες (1 εβδομάδα = ${E.CONFIG.detachedPerWeek}).`]]
+            .map(([k, l, h]) => `<label class="field" for="p-${k}">${l} από-έως (π.χ. 20/11/2026-24/11/2026)<input type="text" id="p-${k}" value="${esc(rr[k] || "")}"></label>
+          <div class="row" style="align-items:end;gap:6px"><label class="field" style="flex:1;min-width:120px">από<input type="date" id="p-${k}-from"></label>
+            <label class="field" style="flex:1;min-width:120px">έως<input type="date" id="p-${k}-to"></label>
+            <button class="btn small" data-act="add-range" data-v="${k}">+ Προσθήκη</button></div>
+          <div class="hint">${h}</div>`).join("")}
+          <div class="hint" id="p-away"></div></fieldset>
+        <label class="field" for="p-days">Άλλες μέρες που λείπει (π.χ. Σάββατο, Κυριακή ή 18/11/2026)<input type="text" id="p-days" value="${esc(rr.days || "")}"></label>
         <label class="field" for="p-note">Σημείωση<input type="text" id="p-note" value="${esc(rr.note || "")}"></label>
         <div class="preview" id="p-preview"></div>
         <div class="row"><button class="btn primary" data-act="save-person">Αποθήκευση</button>
@@ -2618,13 +2699,26 @@ window.LICENSES = "ΑΔΕΙΕΣ ΛΟΓΙΣΜΙΚΟΥ ΤΡΙΤΩΝ / THIRD-PARTY 
     if (other) shifts.push(other);
     e.r = { unarmed: $("#p-unarmed").checked, no24h: $("#p-no24").checked, shifts: shifts.join(", "),
       tasks: [...document.querySelectorAll("[data-task]")].filter(x => x.checked).map(x => x.dataset.task).join(", "),
-      days: $("#p-days").value.trim(), note: $("#p-note").value.trim() };
+      days: $("#p-days").value.trim(), leave: $("#p-leave").value.trim(), detached: $("#p-detached").value.trim(),
+      note: $("#p-note").value.trim() };
     return e;
   }
   function updatePersonPreview() {
     const box = $("#p-preview");
     if (!box) return;
     const e = readPersonForm();
+    const away = $("#p-away");
+    if (away) {
+      const part = (label, v, credit) => {
+        if (!v) return "";
+        const rng = E.parseRanges(v, today());
+        if (!rng.length) return `${label}: ⚠ δεν κατάλαβα τις ημερομηνίες`;
+        const days = rng.reduce((a, [f, t]) => a + E.diffDays(t, f) + 1, 0);
+        const txt = `${label}: ${days} μέρες (${rng.map(([f, t]) => E.fmtDate(f, false) + "-" + E.fmtDate(t, false)).join(", ")})`;
+        return credit ? `${txt} = μετράει σαν ${Math.round(days * E.CONFIG.detachedPerWeek / 7 * 10) / 10} υπηρεσίες` : txt;
+      };
+      away.textContent = [part("Άδεια", e.r.leave, false), part("Απόσπαση", e.r.detached, true)].filter(Boolean).join(" · ");
+    }
     let ps; try { ps = E.buildPosts(S.services); } catch (err) { box.textContent = err.message; return; }
     const own = ps.filter(p => !p.linkKind && (!p.rank || E.rankSet(p.rank).has(E.rankKey(e.rank))));
     const w = E.buildWorkers([{ name: e.name || "?", rank: e.rank }], { [e.name || "?"]: e.r }, ps, today())[0];
@@ -2822,8 +2916,15 @@ window.LICENSES = "ΑΔΕΙΕΣ ΛΟΓΙΣΜΙΚΟΥ ΤΡΙΤΩΝ / THIRD-PARTY 
         if (S.example) { S.example = false; S.history = E.emptyHistory(); S.view = null; }
         if (e.orig === null) S.people.push({ name: e.name, rank: e.rank });
         else { const p = S.people.find(x => x.name === e.orig); p.name = e.name; p.rank = e.rank; delete S.rules[e.orig]; }
-        if (e.r.unarmed || e.r.no24h || e.r.shifts || e.r.tasks || e.r.days || e.r.note) S.rules[e.name] = e.r; else delete S.rules[e.name];
+        if (e.r.unarmed || e.r.no24h || e.r.shifts || e.r.tasks || e.r.days || e.r.leave || e.r.detached || e.r.note) S.rules[e.name] = e.r; else delete S.rules[e.name];
         save(); closeSheet(); render(); toast("Αποθηκεύτηκε ✓"); break;
+      }
+      case "add-range": {  // the two date pickers -> «20/11/2026-24/11/2026» added to the text field
+        const f = $(`#p-${v}-from`).value, t = $(`#p-${v}-to`).value || f, box = $(`#p-${v}`);
+        if (!f) { toast("Διάλεξε ημερομηνία «από»."); break; }
+        const txt = `${E.fmtDate(f < t ? f : t)}-${E.fmtDate(f < t ? t : f)}`;
+        box.value = box.value.trim() ? `${box.value.trim()}; ${txt}` : txt;
+        updatePersonPreview(); break;
       }
       case "clear-person": delete S.rules[ui.edit.orig]; save(); closeSheet(); render(); toast("Χωρίς εξαιρέσεις"); break;
       case "del-person":
