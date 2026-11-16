@@ -1,4 +1,4 @@
-const CACHE = "ypiresies-2fcd6e909318";
+const CACHE = "ypiresies-b2a6dcec92c1";
 const FILES = ["./", "index.html", "exceljs.min.js", "manifest.webmanifest", "apple-touch-icon.png", "icon-192.png", "icon-512.png"];
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES)).then(() => self.skipWaiting()));
