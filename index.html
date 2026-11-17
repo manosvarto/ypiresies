@@ -1396,7 +1396,7 @@ details summary { cursor: pointer; font-weight: 600; }
   // ------------------------------------------------------------------ roster workbook (Υπηρεσίες_*.xlsx)
   // Hand-filled tables at the bottom of the paper form (cleaning per area) and the signatures - same as the PC
   const FORM_UNITS = ["1ος Μ/Κ ΛΠΖ", "2ος Μ/Κ ΛΠΖ", "3ος Μ/Κ ΛΠΖ", "ΑΥΤ"];
-  const FORM_AREAS = ["ΕΦΕΔΡΙΚΟΙ", "ΦΥΛΑΚΙΟ Α", "ΦΥΛΑΚΙΟ Β", "ΘΑΛΑΜΟΣ 1ου", "ΘΑΛΑΜΟΣ ΛΑΝ", "ΘΑΛΑΜΟΣ 2ου-ΑΥΤ-ΛΔ",
+  const FORM_AREAS = ["ΕΦΕΔΡΙΚΟΙ", "ΕΦ. ΦΥΛΑΚΙΟ Α", "ΦΥΛΑΚΙΟ Β", "ΘΑΛΑΜΟΣ 1ου", "ΘΑΛΑΜΟΣ ΛΑΝ", "ΘΑΛΑΜΟΣ 2ου-ΑΥΤ-ΛΔ",
     "ΠΡΟΘΑΛΑΜΟΣ", "ΤΟΥΑΛΕΤΕΣ/ΛΟΥΤΡΑ", "ΕΞ. ΧΩΡΟΙ ΚΑΙ ΣΚΑΛΑ", "ΣΧΟΛΕΙΟ"];
   const FORM_SIGNATURES = ["1ος Μ/Κ ΛΠΖ", "2ος Μ/Κ ΛΠΖ", "ΛΑΝ", "ΑΥΤ", "ΛΔ", "Ο ΣΥΝΤΑΞΑΣ", "ΤΟ 2ο ΓΡΑΦΕΙΟ", "ΘΕΩΡΗΘΗΚΕ\nΟ ΔΙΟΙΚΗΤΗΣ"];
   const LIGHT = "FFD9D9D9";
@@ -2202,8 +2202,7 @@ window.LICENSES = "ΑΔΕΙΕΣ ΛΟΓΙΣΜΙΚΟΥ ΤΡΙΤΩΝ / THIRD-PARTY 
   const svcKey = r => N(r.service) + "|" + N(r.post);
   // posts renamed in the form of 17/11 (old name -> new name)
   const RENAMED = new Map([["ΘΑΛΑΜΟΦΥΛΑΚΕΣ", "1ος|ΑΥΤ", "1ος|ΛΥΤ"], ["ΘΑΛΑΜΟΦΥΛΑΚΕΣ", "2ος|ΑΥΤ", "2ος|ΛΥΤ"],
-    ["ΘΑΛΑΜΟΦΥΛΑΚΕΣ", "3ος|ΑΥΤ", "3ος|ΛΥΤ"], ["1ο ΟΧΗΜΑ", "ΣΥΝΟΔΟΣ ΟΧΗΜΑΤΟΣ", "ΣΥΝΟΔΟΣ ΟΧΗΜΑΤΟΣ"],
-    ["2ο ΟΧΗΜΑ", "ΣΥΝΟΔΟΣ ΟΧΗΜΑΤΟΣ", "ΣΥΝΟΔΟΣ ΟΧΗΜΑΤΟΣ"]]
+    ["ΘΑΛΑΜΟΦΥΛΑΚΕΣ", "3ος|ΑΥΤ", "3ος|ΛΥΤ"]]
     .map(([s, a, b]) => [svcKey({ service: s, post: a }), svcKey({ service: s, post: b })]));
   /* The old built-in duties are replaced by those of the current form (all suggested); the ones that were on
      stay on (with their fixed person / pool), and the user's own duties are kept as they are. */
