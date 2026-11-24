@@ -1,15 +1,11 @@
-const CACHE = "ypiresies-a545e9556eb3";
-const FILES = ["./", "index.html", "exceljs.min.js", "manifest.webmanifest", "apple-touch-icon.png", "icon-192.png", "icon-512.png"];
-self.addEventListener("install", e => {
-  e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES)).then(() => self.skipWaiting()));
+// Η σελίδα έκλεισε: ο service worker καθαρίζει ό,τι είχε αποθηκευτεί και αποσύρεται.
+self.addEventListener('install', e => self.skipWaiting());
+self.addEventListener('activate', e => {
+  e.waitUntil((async () => {
+    try { const ks = await caches.keys(); await Promise.all(ks.map(k => caches.delete(k))); } catch (err) {}
+    try { await self.registration.unregister(); } catch (err) {}
+    const cs = await self.clients.matchAll();
+    cs.forEach(c => { try { c.navigate(c.url); } catch (err) {} });
+  })());
 });
-self.addEventListener("activate", e => {
-  e.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k))))
-    .then(() => self.clients.claim()));
-});
-self.addEventListener("fetch", e => {
-  const req = e.request;
-  if (req.method !== "GET" || new URL(req.url).origin !== location.origin) return;
-  e.respondWith(caches.match(req, { ignoreSearch: true }).then(hit => hit ||
-    fetch(req).catch(() => req.mode === "navigate" ? caches.match("index.html") : Response.error())));
-});
+self.addEventListener('fetch', () => {});
